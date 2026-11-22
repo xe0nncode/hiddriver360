@@ -10,7 +10,7 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 
 ## Current limitations
 - rumble is currently implemented for wired DualSense, DualSense Edge, DualShock 4, and DualShock 3 controllers; other HID devices remain input-only
-- adaptive triggers are not implemented yet
+- adaptive triggers are sadly locked down to stiffness and issues with config.
 
 ## Supported controllers
 - DualShock 4 (PS4 controller)
@@ -26,6 +26,10 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 2. Connect controllers via USB
 3. Controllers with a built in mapping will start working right away, for all other controllers that are USB HID compliant a mapping assistant will be started that guides you through the process of mapping your controller
 4. enjoy :)
+
+(OPTIONAL)
+To use adaptive triggers (to configure them), you will have to use an FTP server to your Xbox to change the config.ini file in the Hdd:/, this is
+until I fix the issues with detecting the Usb:/ or add a menu.
 
 ## How to build
 1. Acquire the official Xbox 360 SDK using black magic
