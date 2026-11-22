@@ -9,7 +9,8 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 - The controller works in all tested games
 
 ## Current limitations
-- no rumble support
+- rumble is currently implemented for wired DualSense, DualSense Edge, DualShock 4, and DualShock 3 controllers; other HID devices remain input-only
+- adaptive triggers are not implemented yet
 
 ## Supported controllers
 - DualShock 4 (PS4 controller)

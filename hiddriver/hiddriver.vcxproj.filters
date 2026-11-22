@@ -2,17 +2,27 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <ClCompile Include="main.cpp" />
-    <ClCompile Include="Detours.cpp" />
     <ClCompile Include="hid_parser.cpp" />
     <ClCompile Include="mapping.cpp" />
+    <ClCompile Include="Detours.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="xex.xml" />
-  </ItemGroup>
-  <ItemGroup>
+    <ClInclude Include="exttypes.h" />
+    <ClInclude Include="hid_parser.h" />
+    <ClInclude Include="mapping.h" />
+    <ClInclude Include="syssock.h" />
+    <ClInclude Include="usb.h" />
+    <ClInclude Include="xapiext.h" />
+    <ClInclude Include="xkelib.h" />
     <ClInclude Include="Detours.h" />
     <ClInclude Include="hid_parser.h" />
     <ClInclude Include="mapping.h" />
     <ClInclude Include="usb.h" />
+    <ClInclude Include="*.h" />
+    <ClInclude Include="*.h" />
+    <ClInclude Include="*.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="xex.xml" />
   </ItemGroup>
 </Project>

@@ -278,6 +278,9 @@ struct Controller {
 	// for nintendo specific handshake
 	NINTENDO_HANDSHAKE_STATE nintendo_handshake_state;
 	UsbTrb interruptTrb;
+	UsbTrb outputTrb;
+	BYTE outputReport[64];
+	bool rumbleSupported;
 } __declspec(align(4));
 
 struct MappingState {
@@ -393,6 +396,60 @@ int32_t noopCompleteHandler(DWORD deviceHandle, int32_t status) {
 	return 0;
 }
 
+bool SupportsRumble(uint16_t vendorId, uint16_t productId) {
+	return vendorId == 0x054C &&
+		(productId == 0x0CE6 || productId == 0x0DF2 || // DualSense / DualSense Edge
+		 productId == 0x09CC || productId == 0x05C4 || // DualShock 4
+		 productId == 0x0268); // DualShock 3
+}
+
+void BuildRumbleReport(Controller* controller, BYTE leftMotor, BYTE rightMotor) {
+	memset(controller->outputReport, 0, sizeof(controller->outputReport));
+
+	if (controller->productId == 0x0CE6 || controller->productId == 0x0DF2) {
+		// DualSense USB output report (report ID + common output section).
+		// Byte 1 enables classic compatible vibration and selects haptics.
+		// Bytes 3 and 4 are the right/high-frequency and left/low-frequency motors.
+		controller->outputReport[0] = 0x02;
+		controller->outputReport[1] = 0x03;
+		controller->outputReport[2] = 0x00;
+		controller->outputReport[3] = rightMotor;
+		controller->outputReport[4] = leftMotor;
+	}
+	else if (controller->productId == 0x09CC || controller->productId == 0x05C4) {
+		// DualShock 4 USB output report.
+		// Byte 1 enables motor updates; bytes 4 and 5 are right and left motors.
+		controller->outputReport[0] = 0x05;
+		controller->outputReport[1] = 0x01;
+		controller->outputReport[2] = 0x00;
+		controller->outputReport[4] = rightMotor;
+		controller->outputReport[5] = leftMotor;
+	}
+	else {
+		// DualShock 3 output report.
+		controller->outputReport[0] = 0x01;
+		controller->outputReport[1] = 0x00;
+		controller->outputReport[2] = leftMotor ? 0x01 : 0x00;
+		controller->outputReport[3] = leftMotor;
+		controller->outputReport[4] = rightMotor ? 0x01 : 0x00;
+		controller->outputReport[5] = rightMotor;
+	}
+}
+
+void SendControllerRumble(Controller* controller, BYTE leftMotor, BYTE rightMotor) {
+	if (!controller || !controller->rumbleSupported || !controller->deviceHandle) {
+		return;
+	}
+
+	BuildRumbleReport(controller, leftMotor, rightMotor);
+	SendInterruptRequest(
+		controller->deviceHandle,
+		&controller->outputTrb,
+		controller->outputReport,
+		(controller->productId == 0x0CE6 || controller->productId == 0x0DF2) ? 63 : 32,
+		(DWORD)noopCompleteHandler);
+}
+
 int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 	HidControllerExtension* controllerDriver = (HidControllerExtension*)((BYTE*)deviceHandle - 36);
 
@@ -481,6 +538,32 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 		if (NT_ERROR(status)) {
 			DbgPrint("EINTIM: Failed to open interrupt endpoint %x!\n", status);
 			return status;
+		}
+
+		c.rumbleSupported = SupportsRumble(c.vendorId, c.productId);
+		if (c.rumbleSupported) {
+			usb_endpoint_descriptor* output_descriptor = UsbdGetEndpointDescriptor(
+				controllerDriver->deviceHandle, 0, USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_OUT);
+
+			if (!output_descriptor) {
+				DbgPrint("EINTIM: Rumble endpoint is unavailable for VID:%04x PID:%04x\n",
+					c.vendorId, c.productId);
+				c.rumbleSupported = false;
+			}
+			else {
+				status = UsbdOpenEndpoint(
+					controllerDriver->deviceHandle,
+					USB_ENDPOINT_TYPE_INTERRUPT,
+					output_descriptor->bEndpointAddress,
+					swap_endianness_16(output_descriptor->wMaxPacketSize) & 0x7FF,
+					output_descriptor->bInterval,
+					(DWORD*)&c.outputTrb);
+
+				if (NT_ERROR(status)) {
+					DbgPrint("EINTIM: Failed to open rumble endpoint %x!\n", status);
+					c.rumbleSupported = false;
+				}
+			}
 		}
 
 		uint16_t pktSize = swap_endianness_16(endpoint_descriptor->wMaxPacketSize) & 0x7FF;
@@ -1304,11 +1387,25 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 	return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
 }
 
-DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_STATE* pInputState, BYTE bAmplitude, BYTE bFrequency, BYTE bOffset) {
-	DWORD status = XamInputSetStateDetour.GetOriginal<decltype(&XamInputSetStateHook)>()(user, flags, pInputState, bAmplitude, bFrequency, bOffset);
+DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* pVibration, BYTE bAmplitude, BYTE bFrequency, BYTE bOffset) {
+	DWORD status = XamInputSetStateDetour.GetOriginal<decltype(&XamInputSetStateHook)>()(user, flags, pVibration, bAmplitude, bFrequency, bOffset);
 
 	if ((user & 0xFF) == 0xFF)
 		user = 0;
+
+	for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
+		if (connectedControllers[i].controllerDriver &&
+			connectedControllers[i].userIndex == user) {
+			if (pVibration) {
+				// XamInputSetState receives an XINPUT_VIBRATION buffer.
+				// Convert the 16-bit XInput motor speeds to 8-bit HID motor values.
+				BYTE leftMotor = (BYTE)(pVibration->wLeftMotorSpeed >> 8);
+				BYTE rightMotor = (BYTE)(pVibration->wRightMotorSpeed >> 8);
+				SendControllerRumble(&connectedControllers[i], leftMotor, rightMotor);
+			}
+			break;
+		}
+	}
 
 	if (status == ERROR_DEVICE_NOT_CONNECTED) {
 		Controller* c = nullptr;
