@@ -7,6 +7,8 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <ctype.h>
+#include <stdlib.h>
 #include "Detours.h"
 #include "hid_parser.h"  
 #include "usb.h"
@@ -147,7 +149,7 @@ struct switch_pro_input_report {
 	uint8_t  left_stick[3];  // 12-bit packed: lx in bits [11:0], ly in bits [23:12]
 	uint8_t  right_stick[3]; // same packing for rx, ry
 	uint8_t  vibrator;
-	uint8_t  imu[48];        // 3 � (accel xyz + gyro xyz), each int16_t
+	uint8_t  imu[48];        // 3 x (accel xyz + gyro xyz), each int16_t
 };
 #pragma pack(pop)
 
@@ -278,7 +280,30 @@ struct Controller {
 	// for nintendo specific handshake
 	NINTENDO_HANDSHAKE_STATE nintendo_handshake_state;
 	UsbTrb interruptTrb;
+	UsbTrb outputTrb;
+	BYTE outputReport[64];
+	bool rumbleSupported;
 } __declspec(align(4));
+
+// Static DualSense adaptive-trigger settings.
+// This first implementation deliberately supports only Off and constant Feedback
+// resistance; it does not implement game-specific or dynamically changing effects.
+struct AdaptiveTriggerSettings {
+    bool enabled;
+    bool leftFeedback;
+    BYTE leftPosition; // 0..9 trigger zones
+    BYTE leftStrength; // 0..8; 0 disables the effect
+    bool rightFeedback;
+    BYTE rightPosition; // 0..9 trigger zones
+    BYTE rightStrength; // 0..8; 0 disables the effect
+};
+
+// Built-in fallback values, used until (or if) config.ini is loaded.
+AdaptiveTriggerSettings g_adaptiveTriggerSettings = {
+    true,        // enabled
+    true, 0, 8,  // left trigger: feedback, position 0, strength 8
+    true, 0, 8   // right trigger: feedback, position 0, strength 8
+};
 
 struct MappingState {
 	volatile bool active;
@@ -393,6 +418,317 @@ int32_t noopCompleteHandler(DWORD deviceHandle, int32_t status) {
 	return 0;
 }
 
+static std::string TrimIniString(const std::string& value) {
+    const std::string whitespace = " \t\r\n";
+    size_t first = value.find_first_not_of(whitespace);
+    if (first == std::string::npos)
+        return "";
+    size_t last = value.find_last_not_of(whitespace);
+    return value.substr(first, last - first + 1);
+}
+
+static std::string LowerIniString(const std::string& value) {
+    std::string result = value;
+    for (size_t i = 0; i < result.size(); ++i)
+        result[i] = (char)tolower((unsigned char)result[i]);
+    return result;
+}
+
+static bool ParseIniBool(const std::string& value, bool* result) {
+    std::string lower = LowerIniString(TrimIniString(value));
+    if (lower == "1" || lower == "true" || lower == "yes" || lower == "on") {
+        *result = true;
+        return true;
+    }
+    if (lower == "0" || lower == "false" || lower == "no" || lower == "off") {
+        *result = false;
+        return true;
+    }
+    return false;
+}
+
+static bool ParseIniInteger(const std::string& value, int* result) {
+    std::string trimmed = TrimIniString(value);
+    if (trimmed.empty())
+        return false;
+
+    char* end = nullptr;
+    long parsed = strtol(trimmed.c_str(), &end, 10);
+    if (end == trimmed.c_str() || *end != '\0')
+        return false;
+
+    *result = (int)parsed;
+    return true;
+}
+
+static void ParseTriggerMode(const std::string& value, bool* feedbackEnabled) {
+    std::string mode = LowerIniString(TrimIniString(value));
+    if (mode == "feedback") {
+        *feedbackEnabled = true;
+    }
+    else if (mode == "off") {
+        *feedbackEnabled = false;
+    }
+    else {
+        DbgPrint("EINTIM: Unknown adaptive trigger mode '%s'; using Off.\n", mode.c_str());
+        *feedbackEnabled = false;
+    }
+}
+
+static bool CreateDefaultAdaptiveTriggerConfig(const char* path) {
+    std::ofstream file(path, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        DbgPrint("EINTIM: Could not create %s. Is the USB storage device mounted and writable?\n", path);
+        return false;
+    }
+
+    file << "; HidDriver360 DualSense adaptive-trigger settings\r\n"
+         << "; This file is created automatically the first time the driver runs.\r\n"
+         << "; Edit values and restart/reload the driver to apply changes.\r\n\r\n"
+         << "[AdaptiveTriggers]\r\n"
+         << "Enabled=1\r\n\r\n"
+         << "[LeftTrigger]\r\n"
+         << "Mode=Feedback\r\n"
+         << "Position=0\r\n"
+         << "Strength=5\r\n\r\n"
+         << "[RightTrigger]\r\n"
+         << "Mode=Feedback\r\n"
+         << "Position=0\r\n"
+         << "Strength=5\r\n";
+
+    file.flush();
+    bool writeSucceeded = file.good();
+    file.close();
+    if (file.fail())
+        writeSucceeded = false;
+
+    if (!writeSucceeded) {
+        DbgPrint("EINTIM: Writing default adaptive-trigger config failed at %s.\n", path);
+        return false;
+    }
+
+    DbgPrint("EINTIM: Created default adaptive-trigger config at %s.\n", path);
+    return true;
+}
+
+bool LoadAdaptiveTriggerConfig(const char* path) {
+    // Safe in-memory defaults. If the file is missing, create an enabled starter INI.
+    AdaptiveTriggerSettings settings = { false, false, 4, 4, false, 4, 4 };
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        DbgPrint("EINTIM: Adaptive-trigger INI not found at %s; creating defaults.\n", path);
+        file.clear();
+        if (!CreateDefaultAdaptiveTriggerConfig(path)) {
+            DbgPrint("EINTIM: Config creation failed at %s; keeping current trigger settings.\n", path);
+            return false;
+        }
+
+        file.clear();
+        file.open(path);
+        if (!file.is_open()) {
+            DbgPrint("EINTIM: Created config but could not reopen %s; keeping current settings.\n", path);
+            return false;
+        }
+    }
+
+    std::string line;
+    std::string section;
+    while (std::getline(file, line)) {
+        // Accept UTF-8 BOM on the first line and simple ';' / '#' comments.
+        if (line.size() >= 3 && (unsigned char)line[0] == 0xEF &&
+            (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF)
+            line.erase(0, 3);
+
+        size_t comment = line.find_first_of(";#");
+        if (comment != std::string::npos)
+            line.erase(comment);
+
+        line = TrimIniString(line);
+        if (line.empty())
+            continue;
+
+        if (line[0] == '[' && line[line.size() - 1] == ']') {
+            section = LowerIniString(TrimIniString(line.substr(1, line.size() - 2)));
+            continue;
+        }
+
+        size_t equals = line.find('=');
+        if (equals == std::string::npos)
+            continue;
+
+        std::string key = LowerIniString(TrimIniString(line.substr(0, equals)));
+        std::string value = TrimIniString(line.substr(equals + 1));
+        int numericValue = 0;
+
+        if (section == "adaptivetriggers" && key == "enabled") {
+            bool parsedBool = false;
+            if (ParseIniBool(value, &parsedBool))
+                settings.enabled = parsedBool;
+            else
+                DbgPrint("EINTIM: Invalid AdaptiveTriggers.Enabled value.\n");
+        }
+        else if (section == "lefttrigger") {
+            if (key == "mode") {
+                ParseTriggerMode(value, &settings.leftFeedback);
+            }
+            else if (key == "position") {
+                if (ParseIniInteger(value, &numericValue) && numericValue >= 0 && numericValue <= 9)
+                    settings.leftPosition = (BYTE)numericValue;
+                else
+                    DbgPrint("EINTIM: LeftTrigger.Position must be 0..9.\n");
+            }
+            else if (key == "strength") {
+                if (ParseIniInteger(value, &numericValue) && numericValue >= 0 && numericValue <= 8)
+                    settings.leftStrength = (BYTE)numericValue;
+                else
+                    DbgPrint("EINTIM: LeftTrigger.Strength must be 0..8.\n");
+            }
+        }
+        else if (section == "righttrigger") {
+            if (key == "mode") {
+                ParseTriggerMode(value, &settings.rightFeedback);
+            }
+            else if (key == "position") {
+                if (ParseIniInteger(value, &numericValue) && numericValue >= 0 && numericValue <= 9)
+                    settings.rightPosition = (BYTE)numericValue;
+                else
+                    DbgPrint("EINTIM: RightTrigger.Position must be 0..9.\n");
+            }
+            else if (key == "strength") {
+                if (ParseIniInteger(value, &numericValue) && numericValue >= 0 && numericValue <= 8)
+                    settings.rightStrength = (BYTE)numericValue;
+                else
+                    DbgPrint("EINTIM: RightTrigger.Strength must be 0..8.\n");
+            }
+        }
+    }
+
+    file.close();
+    g_adaptiveTriggerSettings = settings;
+    DbgPrint("EINTIM: Adaptive-trigger config loaded. Master=%d, L2=%d, R2=%d.\n",
+        settings.enabled ? 1 : 0,
+        (settings.leftFeedback && settings.leftStrength > 0) ? 1 : 0,
+        (settings.rightFeedback && settings.rightStrength > 0) ? 1 : 0);
+    return true;
+}
+
+static void BuildFeedbackTriggerEffect(BYTE* report, int offset,
+                                       BYTE position, BYTE strength, bool enabled) {
+    // Each effect occupies 11 bytes: mode + ten parameters.
+    memset(report + offset, 0, 11);
+
+    if (!enabled || strength == 0) {
+        report[offset] = 0x05; // Official Off effect.
+        return;
+    }
+
+    if (position > 9)
+        position = 9;
+    if (strength > 8)
+        strength = 8;
+
+    report[offset] = 0x21; // Feedback: constant resistance after a chosen zone.
+
+    uint16_t activeZones = 0;
+    uint32_t forceZones = 0;
+    BYTE forceValue = (BYTE)((strength - 1) & 0x07);
+
+    for (int zone = position; zone < 10; ++zone) {
+        activeZones |= (uint16_t)(1 << zone);
+        forceZones |= ((uint32_t)forceValue << (3 * zone));
+    }
+
+    report[offset + 1] = (BYTE)(activeZones & 0xFF);
+    report[offset + 2] = (BYTE)((activeZones >> 8) & 0xFF);
+    report[offset + 3] = (BYTE)(forceZones & 0xFF);
+    report[offset + 4] = (BYTE)((forceZones >> 8) & 0xFF);
+    report[offset + 5] = (BYTE)((forceZones >> 16) & 0xFF);
+    report[offset + 6] = (BYTE)((forceZones >> 24) & 0xFF);
+}
+
+bool SupportsRumble(uint16_t vendorId, uint16_t productId) {
+	return vendorId == 0x054C &&
+		(productId == 0x0CE6 || productId == 0x0DF2 || // DualSense / DualSense Edge
+		 productId == 0x09CC || productId == 0x05C4 || // DualShock 4
+		 productId == 0x0268); // DualShock 3
+}
+
+void BuildRumbleReport(Controller* controller, BYTE leftMotor, BYTE rightMotor) {
+	memset(controller->outputReport, 0, sizeof(controller->outputReport));
+
+	if (controller->productId == 0x0CE6 || controller->productId == 0x0DF2) {
+		// DualSense USB output report (report ID + common output section).
+		// Byte 1 enables classic compatible vibration and selects haptics.
+		// Bytes 3 and 4 are the right/high-frequency and left/low-frequency motors.
+		controller->outputReport[0] = 0x02;
+		controller->outputReport[1] = 0x03; // Classic rumble + rumble output mode.
+		controller->outputReport[2] = 0x00;
+		controller->outputReport[3] = rightMotor;
+		controller->outputReport[4] = leftMotor;
+
+		bool rightFeedback = g_adaptiveTriggerSettings.enabled &&
+			g_adaptiveTriggerSettings.rightFeedback && g_adaptiveTriggerSettings.rightStrength > 0;
+		bool leftFeedback = g_adaptiveTriggerSettings.enabled &&
+			g_adaptiveTriggerSettings.leftFeedback && g_adaptiveTriggerSettings.leftStrength > 0;
+
+		// valid_flag0 bit 2 enables R2 and bit 3 enables L2 adaptive effects.
+		if (rightFeedback)
+			controller->outputReport[1] |= 0x04;
+		if (leftFeedback)
+			controller->outputReport[1] |= 0x08;
+
+		// USB report offsets include report ID 0x02 at byte 0.
+		// R2 block: bytes 11..21. L2 block: bytes 22..32.
+		BuildFeedbackTriggerEffect(controller->outputReport, 11,
+			g_adaptiveTriggerSettings.rightPosition,
+			g_adaptiveTriggerSettings.rightStrength, rightFeedback);
+		BuildFeedbackTriggerEffect(controller->outputReport, 22,
+			g_adaptiveTriggerSettings.leftPosition,
+			g_adaptiveTriggerSettings.leftStrength, leftFeedback);
+	}
+	else if (controller->productId == 0x09CC || controller->productId == 0x05C4) {
+		// DualShock 4 USB output report.
+		// Byte 1 enables motor updates; bytes 4 and 5 are right and left motors.
+		controller->outputReport[0] = 0x05;
+		controller->outputReport[1] = 0x01;
+		controller->outputReport[2] = 0x00;
+		controller->outputReport[4] = rightMotor;
+		controller->outputReport[5] = leftMotor;
+	}
+	else {
+		// DualShock 3 output report.
+		controller->outputReport[0] = 0x01;
+		controller->outputReport[1] = 0x00;
+		controller->outputReport[2] = leftMotor ? 0x01 : 0x00;
+		controller->outputReport[3] = leftMotor;
+		controller->outputReport[4] = rightMotor ? 0x01 : 0x00;
+		controller->outputReport[5] = rightMotor;
+	}
+}
+
+void SendControllerRumble(Controller* controller, BYTE leftMotor, BYTE rightMotor) {
+	if (!controller || !controller->rumbleSupported || !controller->deviceHandle) {
+		return;
+	}
+
+	BuildRumbleReport(controller, leftMotor, rightMotor);
+
+	// Debug: confirm the trigger bytes are actually in the report being sent.
+	if (controller->productId == 0x0CE6 || controller->productId == 0x0DF2) {
+		DbgPrint("EINTIM: DS out: flags=%02x R2mode=%02x L2mode=%02x\n",
+			controller->outputReport[1],
+			controller->outputReport[11],
+			controller->outputReport[22]);
+	}
+
+	SendInterruptRequest(
+		controller->deviceHandle,
+		&controller->outputTrb,
+		controller->outputReport,
+		(controller->productId == 0x0CE6 || controller->productId == 0x0DF2) ? 63 : 32,
+		(DWORD)noopCompleteHandler);
+}
+
 int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 	HidControllerExtension* controllerDriver = (HidControllerExtension*)((BYTE*)deviceHandle - 36);
 
@@ -483,6 +819,32 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 			return status;
 		}
 
+		c.rumbleSupported = SupportsRumble(c.vendorId, c.productId);
+		if (c.rumbleSupported) {
+			usb_endpoint_descriptor* output_descriptor = UsbdGetEndpointDescriptor(
+				controllerDriver->deviceHandle, 0, USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_OUT);
+
+			if (!output_descriptor) {
+				DbgPrint("EINTIM: Rumble endpoint is unavailable for VID:%04x PID:%04x\n",
+					c.vendorId, c.productId);
+				c.rumbleSupported = false;
+			}
+			else {
+				status = UsbdOpenEndpoint(
+					controllerDriver->deviceHandle,
+					USB_ENDPOINT_TYPE_INTERRUPT,
+					output_descriptor->bEndpointAddress,
+					swap_endianness_16(output_descriptor->wMaxPacketSize) & 0x7FF,
+					output_descriptor->bInterval,
+					(DWORD*)&c.outputTrb);
+
+				if (NT_ERROR(status)) {
+					DbgPrint("EINTIM: Failed to open rumble endpoint %x!\n", status);
+					c.rumbleSupported = false;
+				}
+			}
+		}
+
 		uint16_t pktSize = swap_endianness_16(endpoint_descriptor->wMaxPacketSize) & 0x7FF;
 		c.reportData = malloc(pktSize * 2);
 		memset(c.reportData, 0, pktSize * 2);
@@ -502,6 +864,13 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 		connectedControllers[globalIndex] = c;
 
 		DbgPrint("EINTIM: Registered virtual controller inside XAM with index: %d.\n", userIndex);
+
+		// Push the static DualSense trigger profile immediately; later rumble updates
+		// include the same trigger blocks so they do not overwrite the configured effect.
+		if (c.vendorId == 0x054C &&
+			(c.productId == 0x0CE6 || c.productId == 0x0DF2)) {
+			SendControllerRumble(&connectedControllers[globalIndex], 0, 0);
+		}
 
 		if (NeedsDualshock3Handshake(c.vendorId, c.productId)) {
 			DbgPrint("EINTIM: Sending dualshock3 handshake!\r\n");
@@ -1304,11 +1673,25 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 	return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
 }
 
-DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_STATE* pInputState, BYTE bAmplitude, BYTE bFrequency, BYTE bOffset) {
-	DWORD status = XamInputSetStateDetour.GetOriginal<decltype(&XamInputSetStateHook)>()(user, flags, pInputState, bAmplitude, bFrequency, bOffset);
+DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* pVibration, BYTE bAmplitude, BYTE bFrequency, BYTE bOffset) {
+	DWORD status = XamInputSetStateDetour.GetOriginal<decltype(&XamInputSetStateHook)>()(user, flags, pVibration, bAmplitude, bFrequency, bOffset);
 
 	if ((user & 0xFF) == 0xFF)
 		user = 0;
+
+	for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
+		if (connectedControllers[i].controllerDriver &&
+			connectedControllers[i].userIndex == user) {
+			if (pVibration) {
+				// XamInputSetState receives an XINPUT_VIBRATION buffer.
+				// Convert the 16-bit XInput motor speeds to 8-bit HID motor values.
+				BYTE leftMotor = (BYTE)(pVibration->wLeftMotorSpeed >> 8);
+				BYTE rightMotor = (BYTE)(pVibration->wRightMotorSpeed >> 8);
+				SendControllerRumble(&connectedControllers[i], leftMotor, rightMotor);
+			}
+			break;
+		}
+	}
 
 	if (status == ERROR_DEVICE_NOT_CONNECTED) {
 		Controller* c = nullptr;
@@ -1554,6 +1937,87 @@ bool initFunctionPointers() {
 	return true;
 }
 
+// Loads the adaptive-trigger config from a background thread. The USB drive is not
+// mounted yet when DllMain runs, so wait, then retry several paths for ~60 seconds.
+// Each path is tried in order: if config.ini exists it is loaded, otherwise the
+// loader tries to create it there and moves to the next path if that fails.
+unsigned int __stdcall AdaptiveConfigThreadProc(void* param) {
+	static const char* paths[] = {
+		"USB0:\\config.ini",   // exact name shown in Xbox 360 Neighborhood
+		"USB:\\config.ini",
+		"Usb0:\\config.ini",
+		"Usb:\\config.ini",
+		"Usb1:\\config.ini",
+		"Mass0:\\config.ini",
+		"HDD:\\config.ini"   // fallback, used only after ~15s so USB gets first chance
+	};
+
+	DbgPrint("EINTIM: Config thread started, waiting 5s for USB...\n");
+	XNotifyUI(XNOTIFYUI_CUSTOM, L"Trigger config thread started");
+	Sleep(5000);
+	for (int attempt = 0; attempt < 30; ++attempt) {
+		const int pathCount = (int)(sizeof(paths) / sizeof(paths[0]));
+		// HDD (the last entry) is only a fallback after ~25s, so USB gets time to mount.
+		const int pathLimit = (attempt < 5) ? pathCount - 1 : pathCount;
+
+		// Read-only probe (never creates anything): err=2 means the drive exists but the
+		// file does not; err=3 / 123 / 1 means that drive name is not mounted.
+		if (attempt == 0 || attempt == 9) {
+			for (int q = 0; q < pathCount - 1; ++q) {
+				HANDLE ph = CreateFileA(paths[q], GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+				if (ph == INVALID_HANDLE_VALUE) {
+					DbgPrint("EINTIM: probe %s -> err=%lu\n", paths[q], GetLastError());
+				}
+				else {
+					DbgPrint("EINTIM: probe %s -> exists\n", paths[q]);
+					CloseHandle(ph);
+				}
+			}
+		}
+
+		for (int p = 0; p < pathLimit; ++p) {
+			if (LoadAdaptiveTriggerConfig(paths[p])) {
+				DbgPrint("EINTIM: Adaptive-trigger config in use from %s\n", paths[p]);
+				{
+					static wchar_t msg[256];
+					swprintf(msg, 256, L"Trigger config loaded: %hs", paths[p]);
+					XNotifyUI(XNOTIFYUI_CUSTOM, msg);
+				}
+
+				// Re-send to any DualSense that is already connected.
+				for (int i = 0; i < 4; ++i) {
+					if (connectedControllers[i].controllerDriver &&
+						connectedControllers[i].vendorId == 0x054C &&
+						(connectedControllers[i].productId == 0x0CE6 ||
+						 connectedControllers[i].productId == 0x0DF2)) {
+						SendControllerRumble(&connectedControllers[i], 0, 0);
+					}
+				}
+				return 0;
+			}
+		}
+		Sleep(2000);
+	}
+	DbgPrint("EINTIM: No usable config.ini location found; keeping built-in trigger defaults.\n");
+	XNotifyUI(XNOTIFYUI_CUSTOM, L"Trigger config.ini not found/creatable. Using built-in defaults.");
+
+	// Report why each path failed (Win32 error code) so we know which names are valid.
+	for (int p = 0; p < (int)(sizeof(paths) / sizeof(paths[0])); ++p) {
+		HANDLE h = CreateFileA(paths[p], GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		static wchar_t emsg[256];
+		if (h == INVALID_HANDLE_VALUE) {
+			swprintf(emsg, 256, L"%hs failed, err=%lu", paths[p], GetLastError());
+		}
+		else {
+			CloseHandle(h);
+			swprintf(emsg, 256, L"%hs opened OK (parse/write issue)", paths[p]);
+		}
+		XNotifyUI(XNOTIFYUI_CUSTOM, emsg);
+		Sleep(2500);
+	}
+	return 0;
+}
+
 BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 	if (Reason == DLL_PROCESS_ATTACH) {
 		if ((XboxKrnlVersion->Build != 17559 && XboxKrnlVersion->Build != 17489) || IsTrayOpen()) {
@@ -1561,10 +2025,12 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 			return FALSE;
 		}
 
-		DbgPrint("EINTIM: HELLO from xbox 360 HID controller driver version 0.6 beta\n");
+		DbgPrint("EINTIM: HELLO from xbox 360 HID controller driver version 0.6 beta (trigger-cfg build 6)\n");
 		if (!initFunctionPointers())
 			return FALSE;
 
+		DbgPrint("EINTIM: Starting config thread\n");
+		MakeThread((LPTHREAD_START_ROUTINE)AdaptiveConfigThreadProc, nullptr);
 		DbgPrint("EINTIM: Loading mappings!\r\n");
 		if (!LoadMappingsFromFile("HDD:\\hiddriver.json")) {
 			DbgPrint("EINTIM: Failed to load mappings(JSON either doesn't exist yet or syntax error)!\r\n");
